@@ -14,10 +14,10 @@ from playwright.async_api import async_playwright
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 EXAM_CONFIG = {
-    "ordinal_sem": "6th",
-    "roman_sem": "VI",
-    "session": "2025",
-    "held_month": "November",
+    "ordinal_sem": "1st",
+    "roman_sem": "I",
+    "session": "2024",
+    "held_month": "May",
     "held_year": "2025"
 }
 
