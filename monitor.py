@@ -68,8 +68,9 @@ CONTINUOUS_DURATION = 900
 CONCURRENCY_LIMIT = 6       
 SCHEDULED_INTERVAL = 600    
 DOWN_REMINDER_DELAY = 600   
-# Discord Limit is 25MB. We set limit to 22MB to be safe.
-MAX_ZIP_SIZE_BYTES = 22 * 1024 * 1024 
+
+# FIXED: Set to 7.5 MB to be safe for Standard Discord Servers (Limit is 8MB-10MB)
+MAX_ZIP_SIZE_BYTES = 7.5 * 1024 * 1024 
 
 class DiscordMonitor:
     def __init__(self):
@@ -105,22 +106,45 @@ class DiscordMonitor:
         except:
             return False
 
-    async def send_file(self, filename: str, data: BytesIO) -> bool:
+    async def send_file(self, filename: str, data: BytesIO, content: str = "") -> bool:
+        """
+        Sends a file WITH a message content to ensure context.
+        Includes error printing to debug delivery failures.
+        """
         if not DISCORD_WEBHOOK_URL: return False
+        
         form = aiohttp.FormData()
+        # Reset pointer to start of file
         data.seek(0)
-        form.add_field("file", data, filename=filename, content_type="application/zip")
+        
+        # Add the message text if provided
+        if content:
+            form.add_field("content", content)
+            
         form.add_field("username", "BEU Monitor")
+        # Add the file
+        form.add_field("file", data, filename=filename, content_type="application/zip")
         
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(DISCORD_WEBHOOK_URL, data=form, timeout=600) as resp:
+                    
+                    # Handle Rate Limits
                     if resp.status == 429:
                         retry = float(resp.headers.get("retry-after", 1))
+                        print(f"Rate limited. Waiting {retry}s...")
                         await asyncio.sleep(retry)
-                        return await self.send_file(filename, data)
-                    return resp.status in (200, 204)
-        except:
+                        return await self.send_file(filename, data, content)
+                    
+                    # Debugging for failures
+                    if resp.status not in (200, 204):
+                        error_text = await resp.text()
+                        print(f"❌ Upload Failed! Status: {resp.status} | Response: {error_text}")
+                        return False
+                        
+                    return True
+        except Exception as e:
+            print(f"❌ Exception during upload: {e}")
             return False
 
     # --- SITE LOGIC ---
@@ -166,7 +190,7 @@ class DiscordMonitor:
                 return (reg_no, None)
 
     async def download_all_pdfs(self) -> List[Tuple[str, Optional[bytes]]]:
-        """Downloads all PDFs and returns them in a list (Memory heavy, but fast)"""
+        """Downloads all PDFs and returns them in a list"""
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(user_agent="Mozilla/5.0")
@@ -179,7 +203,7 @@ class DiscordMonitor:
 
     async def chunk_and_upload_results(self, results):
         """
-        Splits results into multiple ZIPs if they exceed Discord limits.
+        Splits results into multiple ZIPs of ~7.5MB each.
         """
         current_idx = 1
         current_buffer = BytesIO()
@@ -188,22 +212,26 @@ class DiscordMonitor:
         for reg, pdf in results:
             if pdf:
                 # Check size before writing
-                # If current zip > 22MB, save and upload it first
                 if current_buffer.tell() > MAX_ZIP_SIZE_BYTES:
                     # Finalize current chunk
                     current_zip.close()
                     file_size = current_buffer.tell() / (1024*1024)
                     filename = f"Results_Part{current_idx}.zip"
                     
-                    await self.send_discord_message(f"📦 **Batch {current_idx} Ready** ({file_size:.2f} MB). Uploading...")
-                    await self.send_file(filename, current_buffer)
+                    # Upload WITH message
+                    msg = f"📦 **Batch {current_idx} Ready** ({file_size:.2f} MB)"
+                    print(f"Uploading {filename}...")
+                    success = await self.send_file(filename, current_buffer, content=msg)
                     
+                    if not success:
+                        print(f"⚠️ Failed to upload {filename}!")
+
                     # Reset for next chunk
                     current_idx += 1
                     current_buffer = BytesIO()
                     current_zip = zipfile.ZipFile(current_buffer, "w", zipfile.ZIP_DEFLATED)
                 
-                # Write to current zip (whether new or existing)
+                # Write to current zip
                 current_zip.writestr(f"Result_{reg}.pdf", pdf)
             else:
                 current_zip.writestr(f"MISSING_{reg}.txt", "Failed to download.")
@@ -213,8 +241,9 @@ class DiscordMonitor:
             current_zip.close()
             file_size = current_buffer.tell() / (1024*1024)
             filename = f"Results_Part{current_idx}.zip"
-            await self.send_discord_message(f"📦 **Final Batch {current_idx} Ready** ({file_size:.2f} MB). Uploading...")
-            await self.send_file(filename, current_buffer)
+            msg = f"📦 **Final Batch {current_idx} Ready** ({file_size:.2f} MB)"
+            print(f"Uploading {filename}...")
+            await self.send_file(filename, current_buffer, content=msg)
 
     async def continuous_status(self, end_time):
         print("Entering Continuous Status Loop...")
@@ -227,7 +256,7 @@ class DiscordMonitor:
     # --- MAIN LOOP ---
     async def run(self):
         print(f"Monitor Started. Run Duration: {CONTINUOUS_DURATION}s")
-        await self.send_discord_message("🔍 **Monitor Started** (Playwright Check + Auto-Split)")
+        await self.send_discord_message("🔍 **Monitor Started** (Playwright Check + 7.5MB Split)")
         
         async with async_playwright() as p:
             self.check_browser = await p.chromium.launch(headless=True)
@@ -251,7 +280,7 @@ class DiscordMonitor:
                             count = sum(1 for _, pdf in results if pdf)
                             await self.send_discord_message(f"📥 Downloaded {count} PDFs. Compressing...")
 
-                            # 2. Chunk and Upload (Handles 25MB limit)
+                            # 2. Chunk and Upload (Handles 8MB limit)
                             await self.chunk_and_upload_results(results)
                             
                             await self.send_discord_message("✅ **All Batches Uploaded Successfully**")
