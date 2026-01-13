@@ -10,9 +10,10 @@ from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
 
-# Ensure this is set in your environment variables or replace with the actual URL string for testing
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") 
 
+# NOTE: BEU often uses different endpoints for different semesters.
+# If 'result-three' fails, try changing the URL construction to 'result-one' or 'result-two'.
 EXAM_CONFIG = {
     "ordinal_sem": "1st",
     "roman_sem": "I",
@@ -78,6 +79,8 @@ class DiscordMonitor:
         self.last_down_alert_time: float = 0
         self.rate_limit_remaining = 5
         self.rate_limit_reset = 0
+        self.check_browser = None  # Persistent browser for checking
+        self.check_page = None
 
     # --- RATE LIMITED DISCORD MESSENGER ---
     async def send_discord_message(self, content: str) -> bool:
@@ -132,45 +135,49 @@ class DiscordMonitor:
             'regNo': str(reg_no),
             'exam_held': f"{EXAM_CONFIG['held_month']}/{EXAM_CONFIG['held_year']}"
         }
+        # CAUTION: Check if you need 'result-one' or 'result-two' instead of 'result-three'
         return f"https://beu-bih.ac.in/result-three?{urllib.parse.urlencode(params)}"
 
     async def check_connection(self) -> str:
         """
-        FIXED: Checks if the site is UP by verifying the RegNo exists in the page text.
-        This prevents false positives on maintenance pages.
+        FIXED: Uses Playwright to render JS and find the Registration Number.
+        Uses a persistent page to avoid overhead.
         """
         test_reg = REG_LIST[0] 
         canary_url = self.construct_url(test_reg)
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(canary_url, timeout=10) as resp:
-                    if resp.status == 200:
-                        html_content = await resp.text()
-                        
-                        # CRITICAL FIX: 
-                        # Only return "UP" if the Registration No is actually found in the HTML.
-                        if str(test_reg) in html_content:
-                            return "UP"
-                        
-                    return "DOWN"
+            # Reuse the existing page if available, otherwise it will be created in run()
+            if not self.check_page:
+                return "DOWN" # Should not happen if initialized correctly
+
+            await self.check_page.goto(canary_url, timeout=15000)
+            
+            try:
+                # Wait for the registration number to appear in the body (handles AJAX)
+                # Reduced timeout to 5s so we don't block the loop for too long on failure
+                await self.check_page.wait_for_selector(f"text={test_reg}", timeout=5000)
+                return "UP"
+            except:
+                # If selector not found within timeout
+                return "DOWN"
+
         except Exception as e:
+            # print(f"Check failed: {e}")
             return "DOWN"
 
     async def fetch_student_pdf(self, context, reg_no, semaphore) -> Tuple[str, Optional[bytes]]:
-        """Worker to fetch a single PDF with improved waiting logic"""
+        """Worker to fetch a single PDF"""
         async with semaphore:
             page = await context.new_page()
             try:
                 await page.goto(self.construct_url(reg_no), timeout=40000)
                 
+                # Wait for data to load
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    await page.wait_for_selector(f"text={reg_no}", timeout=10000)
                 except:
-                    pass 
-                
-                # Gatekeeper: Wait for RegNo to appear in the text (Validates content loaded)
-                await page.wait_for_selector(f"text={reg_no}", timeout=15000)
+                    pass # Try printing anyway, or it might be blank
 
                 pdf = await page.pdf(format="A4", print_background=True)
                 await page.close()
@@ -181,8 +188,9 @@ class DiscordMonitor:
                 return (reg_no, None)
 
     async def parallel_download_zip(self) -> BytesIO:
-        """Manages the parallel download"""
+        """Manages the parallel download (Starts a FRESH browser for bulk work)"""
         buffer = BytesIO()
+        # We start a fresh Playwright instance for the bulk download to ensure clean state
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
@@ -207,71 +215,75 @@ class DiscordMonitor:
         return buffer
 
     async def continuous_status(self, end_time):
-        """The 'Spam' loop: sends UP status continuously"""
+        """The 'Spam' loop"""
         print("Entering Continuous Status Loop...")
         while time.time() < end_time:
             left = int(end_time - time.time())
             if left <= 0: break
-            
-            # Send message every CHECK_INTERVAL (5s)
             await self.send_discord_message(f"✅ Website still UP ({left}s left)")
             await asyncio.sleep(CHECK_INTERVAL)
 
     # --- MAIN LOOP ---
     async def run(self):
         print(f"Monitor Started. Run Duration: {CONTINUOUS_DURATION}s")
-        await self.send_discord_message("🔍 **Monitor Started** (Checking every 5s)")
+        await self.send_discord_message("🔍 **Monitor Started** (Using Playwright Check)")
         
-        start_time = time.time()
-        end_time = start_time + CONTINUOUS_DURATION
-        
-        while time.time() < end_time:
-            # 1. Check Status
-            status = await self.check_connection()
-            now = time.time()
+        # --- INITIALIZE MONITOR BROWSER ---
+        async with async_playwright() as p:
+            self.check_browser = await p.chromium.launch(headless=True)
+            self.check_page = await self.check_browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
+            self.check_page = await self.check_page.new_page()
 
-            # 2. Status Changed Logic
-            if status == "UP":
-                # If it WAS down (or first check), triggering Immediate Action
-                if self.last_status != "UP":
-                    await self.send_discord_message("🚨 **SITE IS LIVE!** Starting Download...")
-                    
-                    # A. Download
-                    zip_data = await self.parallel_download_zip()
-                    zip_size = zip_data.getbuffer().nbytes / (1024*1024)
-                    
-                    # B. Upload
-                    await self.send_discord_message(f"📤 ZIP Generated ({zip_size:.2f} MB). Uploading...")
-                    success = await self.send_file(f"Results_{int(now)}.zip", zip_data)
-                    
-                    if success:
-                        await self.send_discord_message("✅ **Bulk Download Complete & Uploaded**")
-                    else:
-                        await self.send_discord_message("❌ Upload Failed (Check file size limits).")
-
-                    # C. Enter the 'Spam' Loop (Continuous Status)
-                    # This loop runs until time is up, then the script exits
-                    await self.continuous_status(end_time)
-                    return # Exit after continuous loop finishes
-
-            elif status == "DOWN":
-                # Handle Notifications
-                if self.last_status == "UP":
-                    await self.send_discord_message("🔴 Website went **DOWN**")
-                    self.last_down_alert_time = now
-                elif self.last_status is None:
-                    # First check is DOWN
-                    await self.send_discord_message("🔴 Website is currently **DOWN**")
-                    self.last_down_alert_time = now
-                elif (now - self.last_down_alert_time) > DOWN_REMINDER_DELAY:
-                    # Reminder every 10 mins
-                    await self.send_discord_message("🔴 Reminder: Website is still **DOWN**")
-                    self.last_down_alert_time = now
+            start_time = time.time()
+            end_time = start_time + CONTINUOUS_DURATION
             
-            self.last_status = status
+            try:
+                while time.time() < end_time:
+                    # 1. Check Status
+                    status = await self.check_connection()
+                    now = time.time()
+
+                    # 2. Status Changed Logic
+                    if status == "UP":
+                        if self.last_status != "UP":
+                            await self.send_discord_message("🚨 **SITE IS LIVE!** Starting Download...")
+                            
+                            # A. Download
+                            zip_data = await self.parallel_download_zip()
+                            zip_size = zip_data.getbuffer().nbytes / (1024*1024)
+                            
+                            # B. Upload
+                            await self.send_discord_message(f"📤 ZIP Generated ({zip_size:.2f} MB). Uploading...")
+                            success = await self.send_file(f"Results_{int(now)}.zip", zip_data)
+                            
+                            if success:
+                                await self.send_discord_message("✅ **Bulk Download Complete & Uploaded**")
+                            else:
+                                await self.send_discord_message("❌ Upload Failed (Check file size limits).")
+
+                            await self.continuous_status(end_time)
+                            return 
+
+                    elif status == "DOWN":
+                        if self.last_status == "UP":
+                            await self.send_discord_message("🔴 Website went **DOWN**")
+                            self.last_down_alert_time = now
+                        elif self.last_status is None:
+                            await self.send_discord_message("🔴 Website is currently **DOWN**")
+                            self.last_down_alert_time = now
+                        elif (now - self.last_down_alert_time) > DOWN_REMINDER_DELAY:
+                            await self.send_discord_message("🔴 Reminder: Website is still **DOWN**")
+                            self.last_down_alert_time = now
+                    
+                    self.last_status = status
+                    await asyncio.sleep(CHECK_INTERVAL)
             
-            # 3. Wait for next check
-            await asyncio.sleep(CHECK_INTERVAL)
+            finally:
+                # Cleanup persistent browser
+                if self.check_browser:
+                    await self.check_browser.close()
 
 if __name__ == "__main__":
     asyncio.run(DiscordMonitor().run())
