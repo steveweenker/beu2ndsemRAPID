@@ -1,0 +1,40 @@
+name: BEU Monitor - Backup 2 (Every 11min offset)
+
+on:
+  schedule:
+    # Backup 2: Runs every 11 minutes, offset by 5 minutes
+    # Maximum coverage - catches any gap from primary or backup-1
+    - cron: '5,16,27,38,49 * * * *'
+  
+  workflow_dispatch:
+
+jobs:
+  backup-monitor-2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: Run BEU Monitor (Backup 2)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+      
+      - name: Log Execution
+        run: |
+          echo "🔄 Backup 2 monitor executed at $(date)"

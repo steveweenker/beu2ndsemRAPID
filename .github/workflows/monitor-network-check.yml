@@ -1,0 +1,64 @@
+name: BEU Monitor - Ultra-Fast Network Check (Every minute)
+
+on:
+  schedule:
+    # Ultra-lightweight check: Every minute
+    # Just pings the website, doesn't download PDFs
+    # Catches site up/down status immediately
+    - cron: '* * * * *'
+  
+  workflow_dispatch:
+
+jobs:
+  network-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install minimal dependencies
+        run: |
+          pip install aiohttp
+      
+      - name: Quick Network Status Check
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 << 'EOF'
+          import asyncio
+          import aiohttp
+          import os
+          from datetime import datetime
+          
+          async def quick_check():
+              webhook = os.getenv("DISCORD_WEBHOOK_URL")
+              if not webhook:
+                  print("❌ No webhook configured")
+                  return
+              
+              try:
+                  async with aiohttp.ClientSession() as session:
+                      async with session.get(
+                          "https://beu-bih.ac.in/result-three",
+                          timeout=aiohttp.ClientTimeout(total=10)
+                      ) as resp:
+                          if resp.status == 200:
+                              msg = f"⚡ **Network Status**: ONLINE at {datetime.now().strftime('%H:%M:%S')}"
+                              print(f"✅ {msg}")
+                          else:
+                              msg = f"⚠️ **Network Status**: Server returned {resp.status} at {datetime.now().strftime('%H:%M:%S')}"
+                              print(f"⚠️ {msg}")
+              except asyncio.TimeoutError:
+                  print("❌ Connection timeout - Site might be down")
+              except Exception as e:
+                  print(f"❌ Network error: {str(e)}")
+          
+          asyncio.run(quick_check())
+          EOF

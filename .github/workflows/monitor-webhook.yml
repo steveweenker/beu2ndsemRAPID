@@ -1,0 +1,77 @@
+name: BEU Monitor - Webhook Listener (Discord Command)
+
+on:
+  repository_dispatch:
+    types: [discord-check-now]
+  
+  workflow_dispatch: # Manual GitHub UI button
+
+jobs:
+  webhook-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: Send Discord Notification (Starting)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 << 'EOF'
+          import asyncio
+          import aiohttp
+          import os
+          
+          async def notify():
+              webhook = os.getenv("DISCORD_WEBHOOK_URL")
+              if webhook:
+                  payload = {
+                      "content": "🚀 **MANUAL CHECK TRIGGERED** - Running monitor now..."
+                  }
+                  async with aiohttp.ClientSession() as session:
+                      await session.post(webhook, json=payload)
+          
+          asyncio.run(notify())
+          EOF
+      
+      - name: Run BEU Monitor (On-Demand)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+      
+      - name: Send Completion Notification
+        if: success()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 << 'EOF'
+          import asyncio
+          import aiohttp
+          import os
+          
+          async def notify():
+              webhook = os.getenv("DISCORD_WEBHOOK_URL")
+              if webhook:
+                  payload = {
+                      "content": "✅ **MANUAL CHECK COMPLETED** - All results processed."
+                  }
+                  async with aiohttp.ClientSession() as session:
+                      await session.post(webhook, json=payload)
+          
+          asyncio.run(notify())
+          EOF

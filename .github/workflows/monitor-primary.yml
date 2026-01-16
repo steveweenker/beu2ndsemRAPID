@@ -1,0 +1,49 @@
+name: BEU Monitor - Primary (Every 5min)
+
+on:
+  schedule:
+    # Main monitor: Runs every 5 minutes
+    - cron: '*/5 * * * *'
+  
+  workflow_dispatch: # Manual trigger via GitHub UI
+  
+  repository_dispatch: # Trigger from webhook
+    types: [manual-trigger]
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: Run BEU Monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+      
+      - name: Notify on Success
+        if: success()
+        run: |
+          echo "✅ Primary monitor executed successfully at $(date)"
+      
+      - name: Notify on Failure
+        if: failure()
+        run: |
+          echo "❌ Primary monitor failed at $(date)"
+          exit 1
